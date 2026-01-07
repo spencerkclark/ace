@@ -934,6 +934,29 @@ def test_xarray_subset_has_correct_sample(mock_monthly_netcdfs):
     assert dataset[0][1].equals(dataset2[0][1])
 
 
+def test_xarray_multi_subset(mock_monthly_netcdfs):
+    mock_data: MockData = mock_monthly_netcdfs
+    raw_config = XarrayDataConfig(data_path=mock_data.tmpdir)
+
+    sample_indices = [1, 3]
+    subset_config = XarrayDataConfig(
+        data_path=mock_data.tmpdir,
+        subset=sample_indices,
+    )
+    n_timesteps = 3
+    names = mock_data.var_names.all_names + ["x"]
+    schedule = IntSchedule(start_value=n_timesteps, milestones=[])
+    raw_dataset, _ = get_xarray_dataset(raw_config, names, schedule)
+    subset_dataset, _ = get_xarray_dataset(subset_config, names, schedule)
+
+    assert len(subset_dataset) == len(sample_indices)
+    for subset_dataset_index, raw_dataset_index in enumerate(sample_indices):
+        _, result_times, _, _ = subset_dataset[subset_dataset_index]
+        _, expected_times, _, _ = raw_dataset[raw_dataset_index]
+        assert result_times.sizes["time"] == n_timesteps
+        xr.testing.assert_equal(result_times, expected_times)
+
+
 def test_xarray_concat_has_correct_sample(mock_monthly_netcdfs):
     mock_data: MockData = mock_monthly_netcdfs
     n_timesteps = 5

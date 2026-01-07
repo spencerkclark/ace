@@ -450,7 +450,7 @@ class XarrayDataConfig(DatasetConfigABC):
     n_repeats: int = 1
     engine: Literal["netcdf4", "h5netcdf", "zarr"] = "netcdf4"
     spatial_dimensions: Literal["healpix", "latlon"] = "latlon"
-    subset: Slice | TimeSlice | RepeatedInterval = dataclasses.field(
+    subset: Slice | TimeSlice | RepeatedInterval | list[int] = dataclasses.field(
         default_factory=Slice
     )
     infer_timestep: bool = True
@@ -1069,13 +1069,32 @@ class XarraySubset(DatasetABC):
         self._wrapped_dataset.set_epoch(epoch)
 
 
+def get_subset_for_individual_sample(dataset, sample_index):
+    if sample_index > len(dataset) - 1:
+        raise ValueError(
+            f"sample_index {sample_index} is outside the range of samples "
+            f"available in the full dataset {len(dataset)}."
+        )
+    index_slice = slice(sample_index, sample_index + 1)
+    return XarraySubset(dataset, index_slice)
+
+
 def get_xarray_dataset(
     config: XarrayDataConfig, names: Sequence[str], n_timesteps: IntSchedule
 ) -> tuple["XarraySubset", DatasetProperties]:
+    from fme.core.dataset.concat import XarrayConcat
+
     dataset = XarrayDataset(config, names, n_timesteps)
     properties = dataset.properties
-    index_slice = _as_index_selection(config.subset, dataset)
-    return XarraySubset(dataset, index_slice), properties
+    if isinstance(config.subset, list):
+        subset_datasets = [
+            get_subset_for_individual_sample(dataset, sample_index)
+            for sample_index in config.subset
+        ]
+        return XarrayConcat(subset_datasets), properties
+    else:
+        index_slice = _as_index_selection(config.subset, dataset)
+        return XarraySubset(dataset, index_slice), properties
 
 
 def get_xarray_datasets(
