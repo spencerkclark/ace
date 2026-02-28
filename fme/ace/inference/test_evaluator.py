@@ -16,6 +16,7 @@ import yaml
 
 from fme.ace.aggregator.inference import InferenceEvaluatorAggregatorConfig
 from fme.ace.data_loading.inference import (
+    ExplicitIndices,
     InferenceDataLoaderConfig,
     InferenceInitialConditionIndices,
 )
@@ -23,10 +24,12 @@ from fme.ace.inference.data_writer import DataWriterConfig
 from fme.ace.inference.data_writer.file_writer import FileWriterConfig
 from fme.ace.inference.data_writer.time_coarsen import TimeCoarsenConfig
 from fme.ace.inference.evaluator import (
+    BatchedEnsembleEvaluatorConfig,
     InferenceEvaluatorConfig,
     StepperOverrideConfig,
     main,
     resolve_variable_metadata,
+    run_batched_ensemble_evaluator_from_config,
 )
 from fme.ace.registry import ModuleSelector
 from fme.ace.stepper import Stepper, TrainOutput
@@ -1204,3 +1207,70 @@ def test_evaluator_with_derived_forcings(
 
     # Forcings, including those that are derived, do not end up in output.
     assert insolation_name not in ds
+
+
+def test_batched_ensemble_evaluator(
+    tmp_path: pathlib.Path,
+    very_fast_only: bool,
+):
+    if very_fast_only:
+        pytest.skip("Skipping non-fast tests")
+    forward_steps_in_memory = 2
+    in_names = ["var", "forcing_var", "DSWRFtoa"]
+    out_names = ["var", "ULWRFtoa", "USWRFtoa"]
+    non_derived_names = ["var", "forcing_var", "DSWRFtoa", "ULWRFtoa", "USWRFtoa"]
+    stepper_path = tmp_path / "stepper"
+
+    horizontal = [DimSize("lat", 16), DimSize("lon", 32)]
+
+    dim_sizes = DimSizes(
+        n_time=10,
+        horizontal=horizontal,
+        nz_interface=4,
+    )
+    save_plus_one_stepper(
+        stepper_path,
+        in_names,
+        out_names,
+        mean=0.0,
+        std=1.0,
+        data_shape=dim_sizes.shape_nd,
+    )
+    data = FV3GFSData(
+        path=tmp_path,
+        names=non_derived_names,
+        dim_sizes=dim_sizes,
+        timestep_days=TIMESTEP.total_seconds() / 86400,
+    )
+    loader_config = data.inference_data_loader_config
+    loader_config.start_indices = ExplicitIndices(list(range(8)))
+    config = InferenceEvaluatorConfig(
+        experiment_dir=str(tmp_path),
+        n_forward_steps=2,
+        forward_steps_in_memory=forward_steps_in_memory,
+        checkpoint_path=str(stepper_path),
+        logging=LoggingConfig(
+            log_to_screen=True,
+            log_to_file=False,
+            log_to_wandb=False,
+        ),
+        loader=loader_config,
+        data_writer=DataWriterConfig(
+            save_monthly_files=False,
+            save_prediction_files=True,
+        ),
+        allow_incompatible_dataset=True,  # stepper checkpoint has arbitrary info
+    )
+
+    batched_ensemble_config = BatchedEnsembleEvaluatorConfig(
+        base_evaluator_config=config,
+        batch_size=2,
+    )
+    run_batched_ensemble_evaluator_from_config(batched_ensemble_config)
+    autoregressive_predictions = tmp_path / "autoregressive_predictions.zarr"
+    ds = xr.open_zarr(autoregressive_predictions, decode_timedelta=False)
+    assert ds.chunks["sample"] == tuple(1 for _ in range(ds.sizes["sample"]))
+
+    autoregressive_target = tmp_path / "autoregressive_target.zarr"
+    ds = xr.open_zarr(autoregressive_target, decode_timedelta=False)
+    assert ds.chunks["sample"] == tuple(1 for _ in range(ds.sizes["sample"]))

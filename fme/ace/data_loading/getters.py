@@ -139,6 +139,7 @@ def get_inference_data(
     label_override: list[str] | None = None,
     surface_temperature_name: str | None = None,
     ocean_fraction_name: str | None = None,
+    xarray_dataset: XarrayDataset | None = None,
 ) -> InferenceGriddedData:
     """
     Args:
@@ -155,6 +156,7 @@ def get_inference_data(
             set to None if no ocean temperature prescribing is being used.
         ocean_fraction_name: Name of the ocean fraction variable. Can be set to None
             if no ocean temperature prescribing is being used.
+        dataset: if provided, use this dataset instead of creating a new one.
 
     Returns:
         A data loader for inference with coordinates and metadata.
@@ -166,6 +168,7 @@ def get_inference_data(
         surface_temperature_name=surface_temperature_name,
         ocean_fraction_name=ocean_fraction_name,
         label_override=label_override,
+        dataset=xarray_dataset,
     )
     properties = dataset.properties
 

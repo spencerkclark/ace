@@ -1,19 +1,22 @@
+import copy
 import dataclasses
 import datetime
 import logging
 import os
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
 
 import dacite
 import numpy as np
 import torch
+import xarray as xr
 
 import fme
 import fme.core.logging_utils as logging_utils
 from fme.ace.aggregator.inference import InferenceEvaluatorAggregatorConfig
 from fme.ace.data_loading.batch_data import BatchData
 from fme.ace.data_loading.getters import get_inference_data
-from fme.ace.data_loading.inference import InferenceDataLoaderConfig
+from fme.ace.data_loading.inference import ExplicitIndices, InferenceDataLoaderConfig
 from fme.ace.inference.data_writer import DataWriterConfig, PairedDataWriter
 from fme.ace.inference.data_writer.dataset_metadata import DatasetMetadata
 from fme.ace.inference.default_metadata import get_default_variable_metadata
@@ -27,9 +30,11 @@ from fme.ace.stepper import (
 from fme.ace.stepper.single_module import StepperConfig
 from fme.core.cli import prepare_config, prepare_directory
 from fme.core.dataset.data_typing import VariableMetadata
+from fme.core.dataset.xarray import XarrayDataset
 from fme.core.dataset_info import IncompatibleDatasetInfo
 from fme.core.derived_variables import get_derived_variable_metadata
 from fme.core.dicts import to_flat_dict
+from fme.core.distributed import Distributed
 from fme.core.generics.inference import get_record_to_wandb, run_inference
 from fme.core.logging_utils import LoggingConfig
 from fme.core.timing import GlobalTimer
@@ -344,3 +349,217 @@ def run_evaluator_from_config(config: InferenceEvaluatorConfig):
         **aggregator.get_summary_logs(),
     }
     record_logs([summary_logs])
+
+
+def batched(iterable, n=1):
+    # Since we do not use python 3.12 yet, which includes itertools.batched,
+    # we need to implement this ourselves.
+    # https://stackoverflow.com/questions/8290397/how-to-split-an-iterable-in-constant-size-chunks
+    l = len(iterable)
+    for ndx in range(0, l, n):
+        yield iterable[ndx : min(ndx + n, l)]
+
+
+def set_chunks_and_shards_encoding(
+    ds: xr.Dataset, sample_chunks: int, sample_shards: int | None
+):
+    for name in ds.variables:
+        chunks = []
+        if sample_shards is not None:
+            shards = []
+        for dim, size in ds[name].sizes.items():
+            if dim == "sample":
+                chunks.append(sample_chunks)
+                if sample_shards is not None:
+                    shards.append(sample_shards)
+            else:
+                chunks.append(size)
+                if sample_shards is not None:
+                    shards.append(size)
+        ds[name].encoding["chunks"] = tuple(chunks)
+        if sample_shards is not None:
+            ds[name].encoding["shards"] = tuple(shards)
+    return ds
+
+
+@dataclasses.dataclass
+class BatchedEnsembleEvaluatorConfig:
+    base_evaluator_config: InferenceEvaluatorConfig
+    batch_size: int
+    sample_chunks: int = 120
+    sample_shards: int | None = None
+
+
+def run_batched_ensemble_evaluator_from_config(config: BatchedEnsembleEvaluatorConfig):
+    base_evaluator_config = config.base_evaluator_config
+    batch_size = config.batch_size
+
+    timer = GlobalTimer.get_instance()
+    timer.start_outer("inference")
+    timer.start("initialization")
+
+    if not os.path.isdir(base_evaluator_config.experiment_dir):
+        os.makedirs(base_evaluator_config.experiment_dir, exist_ok=True)
+    base_evaluator_config.configure_logging(log_filename="inference_out.log")
+    env_vars = logging_utils.retrieve_env_vars()
+    beaker_url = logging_utils.log_beaker_url()
+    base_evaluator_config.configure_wandb(env_vars=env_vars, notes=beaker_url)
+
+    if fme.using_gpu():
+        torch.backends.cudnn.benchmark = True
+
+    logging_utils.log_versions()
+    logging.info(f"Current device is {fme.get_device()}")
+
+    stepper_config = base_evaluator_config.load_stepper_config()
+    logging.info("Initializing data loader")
+    window_requirements = stepper_config.get_evaluation_window_data_requirements(
+        n_forward_steps=base_evaluator_config.forward_steps_in_memory
+    )
+    initial_condition_requirements = (
+        stepper_config.get_prognostic_state_data_requirements()
+    )
+
+    dataset = XarrayDataset(
+        base_evaluator_config.loader.dataset,
+        window_requirements.names,
+        window_requirements.n_timesteps_schedule,
+    )
+
+    stepper = base_evaluator_config.load_stepper()
+    stepper.set_eval()
+    timer.stop()
+    for i, batch in enumerate(
+        batched(base_evaluator_config.loader.start_indices.list, n=batch_size)
+    ):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            batch_config = copy.deepcopy(base_evaluator_config)
+            batch_config.loader.start_indices = ExplicitIndices(list(batch))
+            batch_config.experiment_dir = os.path.join(temp_dir)
+            os.makedirs(batch_config.experiment_dir, exist_ok=True)
+            data = get_inference_data(
+                config=batch_config.loader,
+                total_forward_steps=batch_config.n_forward_steps,
+                window_requirements=window_requirements,
+                initial_condition=initial_condition_requirements,
+                xarray_dataset=dataset,
+            )
+
+            aggregator_config: InferenceEvaluatorAggregatorConfig = (
+                batch_config.aggregator
+            )
+            for batch in data.loader:
+                initial_time = batch.time.isel(time=0)
+                break
+            variable_metadata = resolve_variable_metadata(
+                dataset_metadata=data.variable_metadata,
+                stepper_metadata=stepper.training_variable_metadata,
+                stepper_all_names=stepper_config.all_names,
+            )
+            dataset_info = data.dataset_info.update_variable_metadata(variable_metadata)
+            aggregator = aggregator_config.build(
+                dataset_info=dataset_info,
+                record_step_20=batch_config.n_forward_steps >= 20,
+                n_timesteps=batch_config.n_forward_steps
+                + stepper_config.n_ic_timesteps,
+                initial_time=initial_time,
+                channel_mean_names=stepper.loss_names,
+                normalize=stepper.normalizer.normalize,
+                output_dir=batch_config.experiment_dir,
+            )
+
+            writer = batch_config.get_data_writer(
+                timestep=data.timestep,
+                variable_metadata=variable_metadata,
+                coords=data.coords,
+            )
+
+            logging.info("Starting inference")
+            record_logs = get_record_to_wandb(label="inference")
+
+            run_inference(
+                predict=stepper.predict_paired,
+                data=data,
+                aggregator=aggregator,
+                writer=writer,
+                record_logs=record_logs,
+            )
+
+            timer.start("final_writer_flush")
+            logging.info("Starting final flush of data writer")
+            writer.finalize()
+            logging.info("Writing reduced metrics to disk in netcdf format.")
+            aggregator.flush_diagnostics()
+            timer.stop()
+
+            timer.start("zarr_append")
+            predictions_netcdf = os.path.join(temp_dir, "autoregressive_predictions.nc")
+            predictions_zarr = os.path.join(
+                base_evaluator_config.experiment_dir, "autoregressive_predictions.zarr"
+            )
+
+            target_netcdf = os.path.join(temp_dir, "autoregressive_target.nc")
+            target_zarr = os.path.join(
+                base_evaluator_config.experiment_dir, "autoregressive_target.zarr"
+            )
+
+            if os.path.exists(predictions_zarr):
+                ds = xr.open_dataset(predictions_netcdf, decode_timedelta=False)
+                ds.to_zarr(predictions_zarr, append_dim="sample", mode="a")
+
+                ds = xr.open_dataset(target_netcdf, decode_timedelta=False)
+                ds.to_zarr(target_zarr, append_dim="sample", mode="a")
+            else:
+                ds = xr.open_dataset(predictions_netcdf, decode_timedelta=False)
+                ds = set_chunks_and_shards_encoding(
+                    ds,
+                    sample_chunks=config.sample_chunks,
+                    sample_shards=config.sample_shards,
+                )
+                ds.to_zarr(predictions_zarr)
+
+                ds = xr.open_dataset(target_netcdf, decode_timedelta=False)
+                ds = set_chunks_and_shards_encoding(
+                    ds,
+                    sample_chunks=config.sample_chunks,
+                    sample_shards=config.sample_shards,
+                )
+                ds.to_zarr(target_zarr)
+            timer.stop()
+
+    timer.stop_outer("inference")
+    total_steps = (
+        base_evaluator_config.n_forward_steps * base_evaluator_config.loader.n_initial_conditions
+    )
+    inference_duration = timer.get_duration("inference")
+    wandb_logging_duration = timer.get_duration("wandb_logging")
+    total_steps_per_second = total_steps / (
+        inference_duration - wandb_logging_duration
+    )
+    timer.log_durations()
+    logging.info(
+        "Total steps per second (ignoring wandb logging): "
+        f"{total_steps_per_second:.2f} steps/second"
+    )
+
+    summary_logs = {
+        "total_steps_per_second": total_steps_per_second,
+        **timer.get_durations(),
+        **aggregator.get_summary_logs(),
+    }
+    record_logs([summary_logs])
+    Distributed.get_instance().shutdown()
+
+                
+def main_batched_ensemble_evaluator(
+    yaml_config: str, override_dotlist: Sequence[str] | None = None
+):
+    config_data = prepare_config(yaml_config, override=override_dotlist)
+    config = dacite.from_dict(
+        data_class=BatchedEnsembleEvaluatorConfig,
+        data=config_data,
+        config=dacite.Config(strict=True),
+    )
+    prepare_directory(config.base_evaluator_config.experiment_dir, config_data)
+    with GlobalTimer(), torch.no_grad():
+        return run_batched_ensemble_evaluator_from_config(config)
